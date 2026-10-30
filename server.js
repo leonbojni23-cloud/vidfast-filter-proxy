@@ -25,95 +25,85 @@ function isBlocked(hostname) {
     );
 }
 
-// Runs before VidFast scripts.
+// Only block known advertising destinations.
+// All other popup behavior remains unchanged.
 const POPUP_GUARD = `
 <script>
 (function () {
   "use strict";
 
-  // Block all script-created popup windows.
-  try {
-    Object.defineProperty(window, "open", {
-      value: function () {
-        console.warn("[VidFast Filter] Popup blocked");
-        return null;
-      },
-      writable: false,
-      configurable: false
-    });
-  } catch (e) {
-    window.open = function () {
-      console.warn("[VidFast Filter] Popup blocked");
-      return null;
-    };
-  }
+  const blockedHosts = [
+    "smockeddesmoid.qpon",
+    "kappa.suciunsizedzoner.cfd",
+    "bc.cuculireactor.qpon",
+    "fhvfd.com",
+    "hummerleaked.cyou",
+    "ee4po43t22i.vujk8juwjkwtzkjr3u7r.cfd",
+    "drubbed.lisperscathjct.qpon"
+  ];
 
-  function shouldBlockLink(element) {
-    if (!element || !element.getAttribute) return false;
-
-    const target = (
-      element.getAttribute("target") || ""
-    ).toLowerCase();
-
-    if (!target || target === "_self" ||
-        target === "_top" || target === "_parent") {
-      return false;
-    }
-
-    const href = element.getAttribute("href");
-    if (!href || href.startsWith("javascript:")) {
-      return false;
-    }
+  function isAdUrl(value) {
+    if (!value || typeof value !== "string") return false;
 
     try {
-      const url = new URL(href, location.href);
-      return url.origin !== location.origin;
-    } catch (e) {
+      const url = new URL(value, location.href);
+      const host = url.hostname.toLowerCase();
+
+      return blockedHosts.some(domain =>
+        host === domain || host.endsWith("." + domain)
+      );
+    } catch (error) {
       return false;
     }
   }
 
-  // Stop links that try to open external tabs.
-  document.addEventListener("click", function (event) {
-    const link = event.target.closest &&
-      event.target.closest("a");
+  const originalOpen = window.open;
 
-    if (shouldBlockLink(link)) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      console.warn("[VidFast Filter] External tab blocked");
+  window.open = function (url, target, features) {
+    if (isAdUrl(url)) {
+      console.warn("[VidFast Filter] Advertisement popup blocked:", url);
+      return null;
     }
-  }, true);
 
-  document.addEventListener("auxclick", function (event) {
-    const link = event.target.closest &&
-      event.target.closest("a");
+    return originalOpen.call(window, url, target, features);
+  };
 
-    if (shouldBlockLink(link)) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-    }
-  }, true);
-
-  // Stop forms from opening new tabs.
-  document.addEventListener("submit", function (event) {
-    const form = event.target;
-    const target = (
-      form.getAttribute("target") || ""
-    ).toLowerCase();
-
-    if (target && target !== "_self" &&
-        target !== "_top" && target !== "_parent") {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      console.warn("[VidFast Filter] Popup form blocked");
-    }
-  }, true);
-
-  console.log("[VidFast Filter] Popup protection active");
+  console.log("[VidFast Filter] Selective popup protection active");
 })();
 </script>
 `;
+
+function injectPopupGuard(html) {
+  // Reuse an existing CSP nonce when the page provides one.
+  const nonceMatch = html.match(
+    /<script\\b[^>]*\\bnonce=["']([^"']+)["']/i
+  );
+
+  let script = POPUP_GUARD;
+
+  if (nonceMatch) {
+    const nonce = nonceMatch[1]
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;");
+
+    script = script.replace(
+      "<script>",
+      `<script nonce="${nonce}">`
+    );
+  }
+
+  const headMatch = html.match(/<head\\b[^>]*>/i);
+
+  if (!headMatch) {
+    console.warn("[VidFast Filter] HTML head not found");
+    return html;
+  }
+
+  return html.replace(
+    headMatch[0],
+    headMatch[0] + script
+  );
+}
 
 function send(res, status, body, type = "text/plain; charset=utf-8") {
   res.writeHead(status, {
@@ -133,30 +123,13 @@ function proxyLocation(location, upstreamUrl, publicOrigin) {
   }
 
   if (target.hostname === "vidfast.vc") {
-    return publicOrigin + target.pathname +
-      target.search + target.hash;
+    return publicOrigin +
+      target.pathname +
+      target.search +
+      target.hash;
   }
 
   return target.toString();
-}
-
-function injectPopupGuard(html) {
-  // Remove restrictive HTML meta CSP before injecting our script.
-  html = html.replace(
-    /<meta[^>]+http-equiv=["']content-security-policy["'][^>]*>/ig,
-    ""
-  );
-
-  const headMatch = html.match(/<head\b[^>]*>/i);
-
-  if (headMatch) {
-    return html.replace(
-      headMatch[0],
-      headMatch[0] + POPUP_GUARD
-    );
-  }
-
-  return POPUP_GUARD + html;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -175,8 +148,8 @@ const server = http.createServer(async (req, res) => {
           service: "vidfast-filter-proxy",
           upstream: UPSTREAM_ORIGIN,
           blockedHostCount: BLOCKED_HOSTS.size,
-          popupProtection: true,
-          version: 4
+          popupProtection: "selective",
+          version: 5
         }),
         "application/json; charset=utf-8"
       );
@@ -297,7 +270,7 @@ const server = http.createServer(async (req, res) => {
     ) {
       const cookies = upstreamResponse.headers.getSetCookie().map(
         cookie => cookie.replace(
-          /;\s*Domain=\.?vidfast\.vc/ig,
+          /;\\s*Domain=\\.?vidfast\\.vc/ig,
           ""
         )
       );
@@ -316,7 +289,7 @@ const server = http.createServer(async (req, res) => {
       responseHeaders["content-type"] =
         "text/html; charset=utf-8";
 
-      // Body changed, so old validators and lengths are invalid.
+      // The HTML changed, so the original validators no longer apply.
       delete responseHeaders.etag;
       delete responseHeaders["last-modified"];
       delete responseHeaders["content-range"];
@@ -352,6 +325,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `VidFast Filter Proxy v4 listening on ${PORT}`
+    `VidFast Filter Proxy v5 listening on ${PORT}`
   );
 });
